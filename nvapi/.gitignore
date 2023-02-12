@@ -1,0 +1,4 @@
+lib/x86/nvapi.lib
+lib/amd64/nvapi64.lib
+include/nvapi/*.h
+include/nvapi/*.c
