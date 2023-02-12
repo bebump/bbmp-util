@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
 
-include(FetchContent)
-
 project(nvapi VERSION 5.2.0)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)

@@ -1,4 +1,4 @@
-#include "NvGpuTempReader.h"
+#include "bbmp_NvGpuTempReader.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -11,8 +11,8 @@
 #include <string>
 
 #ifndef jassertfalse
-#include <cassert>
-#define jassertfalse assert (false)
+ #include <cassert>
+ #define jassertfalse assert (false)
 #endif
 
 namespace bbmp

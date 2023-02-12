@@ -1,4 +1,4 @@
-#include "NvGpuTempReader.h"
+#include "bbmp_NvGpuTempReader.h"
 
 int main()
 {
