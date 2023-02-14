@@ -3,10 +3,10 @@
 #include "bbmp_WindowsHandles.h"
 
 #include <array>
+#include <cassert>
 #include <cstring>
 #include <functional>
 #include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -28,6 +28,12 @@ enum class ChildInheritsHandle
     yes
 };
 
+enum class PipeDirection
+{
+    inbound,
+    outbound
+};
+
 static auto createSecurityDescriptor (ChildInheritsHandle inherit)
 {
     SECURITY_ATTRIBUTES securityAttributes;
@@ -39,114 +45,120 @@ static auto createSecurityDescriptor (ChildInheritsHandle inherit)
     return securityAttributes;
 }
 
+struct WindowsPipe
+{
+    PipeDirection pipeDirection;
+    std::string pipeName;
+    WindowsHandle<-1> pipe;
+
+    auto get() const
+    {
+        return pipe.get();
+    }
+};
+
+static auto createPipe (PipeDirection dir)
+{
+    static int processPipeId = 0;
+
+    const auto pipeName = std::string ("\\\\.\\pipe\\") + std::to_string (GetCurrentProcessId())
+                                                        + std::to_string (processPipeId++);
+
+    auto securityAttribs = createSecurityDescriptor (dir == PipeDirection::inbound ? ChildInheritsHandle::no
+                                                                                   : ChildInheritsHandle::no);
+
+    auto pipe = WindowsHandle<-1> (CreateNamedPipeA (pipeName.c_str(),
+                                                     (dir == PipeDirection::inbound ? PIPE_ACCESS_INBOUND
+                                                                                    : PIPE_ACCESS_OUTBOUND)
+                                                         | FILE_FLAG_OVERLAPPED,
+                                                     0,
+                                                     1,
+                                                     8192,
+                                                     8192,
+                                                     0,
+                                                     &securityAttribs));
+
+    return WindowsPipe { dir, pipeName, std::move (pipe) };
+}
+
+static auto createOverlappedOppositeHandle (const WindowsPipe& pipe)
+{
+    auto securityAttribs = createSecurityDescriptor (ChildInheritsHandle::yes);
+
+    return WindowsHandle<-1> (CreateFileA (pipe.pipeName.c_str(),
+                                           pipe.pipeDirection == PipeDirection::inbound ? GENERIC_WRITE : GENERIC_READ,
+                                           0,
+                                           &securityAttribs,
+                                           OPEN_EXISTING,
+                                           FILE_FLAG_OVERLAPPED,
+                                           NULL));
+}
+
+class OverlappedWithEvent
+{
+public:
+    OverlappedWithEvent()
+    {
+        ZeroMemory (&overlapped, sizeof (overlapped));
+        overlapped.hEvent = CreateEvent (NULL, TRUE, FALSE, NULL);
+
+        if (overlapped.hEvent == NULL)
+            throw std::runtime_error ("OverlappedWithEvent: CreateEvent failed");
+    }
+
+    ~OverlappedWithEvent()
+    {
+        CloseHandle (overlapped.hEvent);
+    }
+
+    auto& get() { return overlapped; }
+
+private:
+    OVERLAPPED overlapped;
+};
+
+class OverlappedWithPointer
+{
+public:
+    OverlappedWithPointer (void* ptr)
+    {
+        ZeroMemory (&overlapped, sizeof (overlapped));
+        overlapped.hEvent = ptr;
+    }
+
+    auto& get() { return overlapped; }
+
+private:
+    OVERLAPPED overlapped;
+};
+
 class ChildProcess::Impl
 {
 public:
     Impl (const std::string& path_to_exe, std::function<void (const char*, size_t)> read_callback)
-        : read_callback_ (std::move (read_callback)), read_issued_ (false)
+        : read_callback_ (std::move (read_callback)), readIssued (false)
     {
-        const auto pipe_name =
-            std::string ("\\\\.\\pipe\\") + std::string (std::to_string (GetCurrentProcessId()));
-        const auto pipe_name2 =
-            std::string ("\\\\.\\pipe\\") + std::string (std::to_string (GetCurrentProcessId()) + "2");
-
-        parent_read_handle_ = [&]
+        const auto connectPipe = [&] (auto& pipe)
         {
-            auto securityAttribs = createSecurityDescriptor (ChildInheritsHandle::no);
+            OverlappedWithEvent overlapped;
+            auto success = ConnectNamedPipe (pipe.get(), &overlapped.get());
 
-            return WindowsHandle<-1> (CreateNamedPipeA (pipe_name.c_str(),
-                                                        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
-                                                        0,
-                                                        1,
-                                                        8192,
-                                                        8192,
-                                                        0,
-                                                        &securityAttribs));
-        }();
-
-        child_write_handle_ = [&]
-        {
-            auto securityAttribs = createSecurityDescriptor (ChildInheritsHandle::yes);
-
-            return WindowsHandle<-1> (CreateFileA (pipe_name.c_str(),
-                                                   GENERIC_WRITE,
-                                                   0,
-                                                   &securityAttribs,
-                                                   OPEN_EXISTING,
-                                                   FILE_FLAG_OVERLAPPED,
-                                                   NULL));
-        }();
-
-        parent_write_handle_ = [&]
-        {
-            auto securityAttribs = createSecurityDescriptor (ChildInheritsHandle::no);
-
-            return WindowsHandle<-1> (CreateNamedPipeA (pipe_name2.c_str(),
-                                                        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-                                                        0,
-                                                        1,
-                                                        8192,
-                                                        8192,
-                                                        0,
-                                                        &securityAttribs));
-        }();
-
-        child_read_handle_ = [&]
-        {
-            auto securityAttribs = createSecurityDescriptor (ChildInheritsHandle::yes);
-
-            return WindowsHandle<-1> (CreateFileA (pipe_name2.c_str(),
-                                                   GENERIC_READ,
-                                                   0,
-                                                   &securityAttribs,
-                                                   OPEN_EXISTING,
-                                                   FILE_FLAG_OVERLAPPED,
-                                                   NULL));
-        }();
-
-        //****************
-        // Read handle for the parent process
-        //        parent_write_handle_ =
-        //            WindowsHandle<-1> (CreateNamedPipeA (pipe_name.c_str(),
-        //                                                 PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-        //                                                 0,
-        //                                                 1,
-        //                                                 8192,
-        //                                                 8192,
-        //                                                 0,
-        //                                                 &security_attributes));
-
-        // Event handle for ConnectNamedPipe
-        ZeroMemory (&overlapped_, sizeof (overlapped_));
-        overlapped_.hEvent = CreateEvent (NULL, TRUE, FALSE, NULL);
-        if (overlapped_.hEvent == NULL)
-        {
-            throw std::runtime_error ("CreateEvent failed");
-        }
-
-        ScopeGuard overlapped_hEvent_guard;
-        overlapped_hEvent_guard.add ([this]() { CloseHandle (overlapped_.hEvent); });
-
-        // Connect to the pipe
-        BOOL success = ConnectNamedPipe (parent_read_handle_.Get(), &overlapped_);
-        if (! success)
-        {
-            if (GetLastError() == ERROR_IO_PENDING)
+            if (! success)
             {
-                if (WaitForSingleObject (overlapped_.hEvent, INFINITE) == WAIT_FAILED)
+                if (GetLastError() == ERROR_IO_PENDING)
                 {
-                    CloseHandle (overlapped_.hEvent);
-                    throw std::runtime_error ("failed WSFO for ConnectNamedPipe");
+                    if (WaitForSingleObject (overlapped.get().hEvent, INFINITE) == WAIT_FAILED)
+                        throw std::runtime_error ("Failed WaitForSingleObject for ConnectNamedPipe");
+                }
+                else if (GetLastError() != ERROR_PIPE_CONNECTED)
+                {
+                    throw std::runtime_error ("Failed to connect to named pipe");
                 }
             }
-            else if (GetLastError() != ERROR_PIPE_CONNECTED)
-            {
-                CloseHandle (overlapped_.hEvent);
-                throw std::runtime_error ("failed to connect to named pipe");
-            }
-        }
-        CloseHandle (overlapped_.hEvent);
-        overlapped_hEvent_guard.cancelAll();
+        };
+
+        for (auto* pipe : std::initializer_list<WindowsPipe*> { &parentReadHandle, &parentWriteHandle })
+            connectPipe (*pipe);
 
         // Spawn the new process
         PROCESS_INFORMATION process_information;
@@ -155,9 +167,9 @@ public:
         ZeroMemory (&startupinfo, sizeof (STARTUPINFO));
         startupinfo.cb = sizeof (STARTUPINFO);
 
-        startupinfo.hStdInput  = child_read_handle_.Get();
-        startupinfo.hStdError  = child_write_handle_.Get();
-        startupinfo.hStdOutput = child_write_handle_.Get();
+        startupinfo.hStdInput  = childReadHandle.get();
+        startupinfo.hStdError  = childWriteHandle.get();
+        startupinfo.hStdOutput = childWriteHandle.get();
         startupinfo.dwFlags    = STARTF_USESTDHANDLES;
 
         const int command_buffer_size = 2048;
@@ -165,82 +177,111 @@ public:
         strncpy (command_buffer, path_to_exe.c_str(), command_buffer_size);
         command_buffer[command_buffer_size - 1] = '\n';
 
-        success = CreateProcess (NULL,
-                                 command_buffer,
-                                 NULL,
-                                 NULL,
-                                 TRUE,
-                                 CREATE_NO_WINDOW,
-                                 0,
-                                 NULL,
-                                 &startupinfo,
-                                 &process_information);
+        const auto success = CreateProcess (NULL,
+                                            command_buffer,
+                                            NULL,
+                                            NULL,
+                                            TRUE,
+                                            CREATE_NO_WINDOW,
+                                            0,
+                                            NULL,
+                                            &startupinfo,
+                                            &process_information);
         if (! success)
-        {
             throw std::runtime_error (std::string ("CreateProcess failed with: ") + command_buffer);
-        }
 
-        process_handle_ = WindowsHandle<-1> (process_information.hProcess);
-        thread_handle_  = WindowsHandle<-1> (process_information.hThread);
-
-        // We reuse the overlapped_ structure for read() calls
-        ZeroMemory (&overlapped_, sizeof (decltype (overlapped_)));
-        overlapped_.hEvent = reinterpret_cast<HANDLE> (this);
+        processHandle = WindowsHandle<-1> (process_information.hProcess);
+        threadHandle  = WindowsHandle<-1> (process_information.hThread);
     }
 
     void IssueRead()
     {
-        auto lock = std::lock_guard (read_mutex_);
-        if (read_issued_)
-        {
+        if (readIssued)
             return;
-        }
-        auto success = ReadFileEx (
-            parent_read_handle_.Get(), read_buffer_.data(), read_buffer_.size(), &overlapped_, ReadCallback);
-        if (! success)
-        {
-            throw std::runtime_error ("ReadFileEx failed");
-        }
 
-        read_issued_ = true;
+        const auto success = ReadFileEx (parentReadHandle.get(),
+                                         read_buffer_.data(),
+                                         read_buffer_.size(),
+                                         &readOverlapped.get(),
+                                         ReadCallback);
+
+        if (! success)
+            throw std::runtime_error ("ReadFileEx failed");
+
+        readIssued = true;
     }
 
-    void Write (const std::string& msg)
+    bool TryIssueWrite (std::string msg)
     {
+        if (writeIssued)
+            return false;
+
+        outgoingMessage = msg;
+
+        const auto success = WriteFileEx (parentWriteHandle.get(),
+                                          outgoingMessage.c_str(),
+                                          outgoingMessage.size(),
+                                          &writeOverlapped.get(),
+                                          WriteCallback);
+
+        if (! success)
+            throw std::runtime_error ("WriteFileEx failed");
+
+        writeIssued = true;
+        return writeIssued;
     }
 
     ~Impl()
     {
-        int result = CancelIoEx (parent_read_handle_.Get(), &overlapped_);
-        if (result != 0 || GetLastError() != ERROR_NOT_FOUND)
+        int resultCancelRead  = CancelIoEx (parentReadHandle.get(), &readOverlapped.get());
+        int resultCancelWrite = CancelIoEx (parentWriteHandle.get(), &writeOverlapped.get());
+
+        // TODO: ati: what?
+        if (resultCancelRead != 0 || resultCancelWrite || GetLastError() != ERROR_NOT_FOUND)
         {
-            read_issued_ = true;
-            while (read_issued_)
+            readIssued = true;
+
+            while (readIssued)
             {
                 SleepEx (50, true);
             }
+        }
+
+        std::cout << "Waiting for subprocess to exit..." << std::endl;
+
+        if (WaitForSingleObject (processHandle.get(), 1000) == WAIT_TIMEOUT)
+        {
+            std::cout << "Killing subprocess" << std::endl;
+            TerminateProcess (processHandle.get(), 1);
         }
     }
 
 private:
     std::function<void (const char*, size_t)> read_callback_;
     std::array<char, 1024> read_buffer_ {};
-    OVERLAPPED overlapped_;
-    WindowsHandle<-1> parent_read_handle_;
-    WindowsHandle<-1> child_write_handle_;
-    WindowsHandle<-1> parent_write_handle_;
-    WindowsHandle<-1> child_read_handle_;
-    WindowsHandle<-1> process_handle_;
-    WindowsHandle<-1> thread_handle_;
-    bool read_issued_;
-    std::mutex read_mutex_;
+    std::string outgoingMessage;
+    WindowsPipe parentReadHandle = createPipe (PipeDirection::inbound);
+    WindowsHandle<-1> childWriteHandle = createOverlappedOppositeHandle (parentReadHandle);
+    WindowsPipe parentWriteHandle = createPipe (PipeDirection::outbound);
+    WindowsHandle<-1> childReadHandle = createOverlappedOppositeHandle (parentWriteHandle);
+    WindowsHandle<-1> processHandle;
+    WindowsHandle<-1> threadHandle;
+    OverlappedWithPointer writeOverlapped { this };
+    OverlappedWithPointer readOverlapped  { this };
+    bool readIssued = false;
+    bool writeIssued  = false;
 
     static void ReadCallback (DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
     {
         auto p_this = reinterpret_cast<Impl*> (lpOverlapped->hEvent);
-        auto lock   = std::lock_guard (p_this->read_mutex_);
         p_this->read_callback_ (p_this->read_buffer_.data(), dwNumberOfBytesTransfered);
-        p_this->read_issued_ = false;
+        p_this->readIssued = false;
+    }
+
+    static void WriteCallback (DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
+    {
+        auto p_this = reinterpret_cast<Impl*> (lpOverlapped->hEvent);
+        p_this->writeIssued = false;
     }
 };
 
@@ -257,9 +298,9 @@ void ChildProcess::IssueRead()
     impl->IssueRead();
 }
 
-void ChildProcess::Write (const std::string& msg)
+bool ChildProcess::TryIssueWrite (const std::string& msg)
 {
-    impl->Write (msg);
+    return impl->TryIssueWrite (msg);
 }
 
 int WindowsSleepEx (uint32_t timeoutMilliseconds, bool alertable)

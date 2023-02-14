@@ -16,21 +16,18 @@
 
 std::string GetLastErrorAsString();
 
-/*
- * The (sad) reason for the templated approach:
- *
- * Some Win32 API functions return INVALID_HANDLE_VALUE (-1) to signal a failed
- * attempt. I actually have seen 0 returned by them as a valid, working handle.
- *
- * Others return NULL.
- */
+/* The (sad) reason for the templated approach:
+
+   Some Win32 API functions return INVALID_HANDLE_VALUE (-1) to signal a failed attempt. I actually
+   have seen 0 returned by them as a valid, working handle.
+
+   Others return NULL.
+*/
 template <int V_INVALID>
 class WindowsHandle final
 {
 public:
-    WindowsHandle() : handle (reinterpret_cast<HANDLE> (V_INVALID))
-    {
-    }
+    WindowsHandle() = default;
 
     WindowsHandle (HANDLE raw_handle) : handle (raw_handle)
     {
@@ -42,30 +39,20 @@ public:
     WindowsHandle (WindowsHandle<V_INVALID>&& other)
     {
         if (handle != reinterpret_cast<HANDLE> (V_INVALID))
-        {
-            const auto success = CloseHandle (handle);
-            if (! success)
-            {
+            if (CloseHandle (handle) == TRUE)
                 throw std::runtime_error ("Failed to close WindowsHandle");
-            }
-        }
 
-        handle       = other.Get();
+        handle       = other.get();
         other.handle = reinterpret_cast<HANDLE> (V_INVALID);
     }
 
     WindowsHandle& operator= (WindowsHandle<V_INVALID>&& other)
     {
         if (handle != reinterpret_cast<HANDLE> (V_INVALID))
-        {
-            const auto success = CloseHandle (handle);
-            if (! success)
-            {
+            if(! CloseHandle (handle))
                 throw std::runtime_error ("Failed to close WindowsHandle");
-            }
-        }
 
-        handle       = other.Get();
+        handle       = other.get();
         other.handle = reinterpret_cast<HANDLE> (V_INVALID);
         return *this;
     }
@@ -74,25 +61,19 @@ public:
     {
         // The handle can become invalid after a move operation
         if (handle != reinterpret_cast<HANDLE> (V_INVALID))
-        {
             const auto success = CloseHandle (handle);
-            if (! success)
-            {
-                // TODO: log error as we can't throw from destructor
-            }
-        }
     }
 
-    HANDLE& Get()
+    const HANDLE& get() const
     {
         throwIfHandleIsInvalid();
         return handle;
     }
 
 private:
-    HANDLE handle;
+    HANDLE handle = reinterpret_cast<HANDLE> (V_INVALID);
 
-    void throwIfHandleIsInvalid()
+    void throwIfHandleIsInvalid() const
     {
         if (handle == reinterpret_cast<HANDLE> (V_INVALID))
         {

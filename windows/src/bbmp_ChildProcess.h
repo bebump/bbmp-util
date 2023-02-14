@@ -17,7 +17,7 @@ public:
 
     void IssueRead();
 
-    void Write (const std::string& msg);
+    bool TryIssueWrite (const std::string& msg);
 
 private:
     class Impl;
