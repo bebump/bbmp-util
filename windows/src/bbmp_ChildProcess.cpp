@@ -135,8 +135,8 @@ private:
 class ChildProcess::Impl
 {
 public:
-    Impl (const std::string& path_to_exe, std::function<void (const char*, size_t)> read_callback)
-        : read_callback_ (std::move (read_callback)), readIssued (false)
+    Impl (const std::string& path_to_exe, std::function<void (const char*, size_t)> readCallbackIn)
+        : readCallback (std::move (readCallbackIn)), readIssued (false)
     {
         const auto connectPipe = [&] (auto& pipe)
         {
@@ -257,7 +257,7 @@ public:
     }
 
 private:
-    std::function<void (const char*, size_t)> read_callback_;
+    std::function<void (const char*, size_t)> readCallback;
     std::array<char, 1024> read_buffer_ {};
     std::string outgoingMessage;
     WindowsPipe parentReadHandle = createPipe (PipeDirection::inbound);
@@ -273,21 +273,22 @@ private:
 
     static void ReadCallback (DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
     {
-        auto p_this = reinterpret_cast<Impl*> (lpOverlapped->hEvent);
-        p_this->read_callback_ (p_this->read_buffer_.data(), dwNumberOfBytesTransfered);
-        p_this->readIssued = false;
+        auto& self = *reinterpret_cast<Impl*> (lpOverlapped->hEvent);
+        self.readCallback (self.read_buffer_.data(), dwNumberOfBytesTransfered);
+        self.readIssued = false;
     }
 
     static void WriteCallback (DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
     {
-        auto p_this = reinterpret_cast<Impl*> (lpOverlapped->hEvent);
-        p_this->writeIssued = false;
+        // TODO: ati: check error code
+        auto& self = *reinterpret_cast<Impl*> (lpOverlapped->hEvent);
+        self.writeIssued = false;
     }
 };
 
 ChildProcess::ChildProcess (const std::string& pathToExe,
-                            std::function<void (const char*, size_t)> read_callback)
-    : impl (std::make_unique<Impl> (pathToExe, std::move (read_callback)))
+                            std::function<void (const char*, size_t)> readCallbackIn)
+    : impl (std::make_unique<Impl> (pathToExe, std::move (readCallbackIn)))
 {
 }
 
